@@ -40,6 +40,14 @@ except Exception as e:
 
 
 # fvcore flops =======================================
+class Permute(nn.Module):
+    def __init__(self, *dims):
+        super().__init__()
+        self.dims = dims
+        
+    def forward(self, x):
+        return x.permute(*self.dims)
+
 def flops_selective_scan_fn(B=1, L=256, D=768, N=16, with_D=True, with_Z=False, with_complex=False):
     """
     u: r(B D L)
@@ -1017,7 +1025,26 @@ class Decoder_Block(nn.Module):
 
         return output
 
-
+class MineNDVIAttention(nn.Module):
+    def __init__(self, dim, reduction_ratio=4):
+        super().__init__()
+        self.ndvi_proj = nn.Sequential(
+            nn.Conv2d(1, dim//reduction_ratio, kernel_size=3, padding=1, bias=False),
+            Permute(0, 2, 3, 1),  # 新增：转换为(B,H,W,C)格式
+            nn.LayerNorm(dim//reduction_ratio),
+            Permute(0, 3, 1, 2),  # 转回(B,C,H,W)
+            nn.ReLU(inplace=True),
+            nn.Conv2d(dim//reduction_ratio, dim, kernel_size=1, bias=False)
+        )
+        self.attn_act = nn.Sigmoid()
+        
+    def forward(self, x, ndvi):
+        """
+        x: (B,C,H,W) 主特征
+        ndvi: (B,1,H,W) 归一化的NDVI值
+        """
+        attn = 0.5 + self.attn_act(self.ndvi_proj(ndvi))  # 权重范围0.5-1.5
+        return x * attn
 
 class RSM_SS(nn.Module):
     def __init__(
@@ -1048,18 +1075,32 @@ class RSM_SS(nn.Module):
         use_checkpoint=False,
         # =========================
         use_ndvi=True,
+        use_ndvi_attn=True,
         # =========================  
         **kwargs,
     ):
         super().__init__()
         self.num_classes = num_classes
         self.num_layers = len(depths)
+
         if isinstance(dims, int):
             dims = [int(dims * 2 ** i_layer) for i_layer in range(self.num_layers)]
         self.num_features = dims[-1]
         self.dims = dims
         dpr = [x.item() for x in torch.linspace(0, drop_path_rate, sum(depths))]  # stochastic depth decay rule
         
+        self.use_ndvi_attn = use_ndvi_attn
+        # 修改后的注意力模块初始化
+        if self.use_ndvi_attn:
+            self.ndvi_attn1 = MineNDVIAttention(dims[0])
+            self.ndvi_attn2 = MineNDVIAttention(dims[1]) 
+            self.ndvi_attn3 = MineNDVIAttention(dims[2])
+        else:
+            self.ndvi_attn1 = nn.Identity()
+            self.ndvi_attn2 = nn.Identity()
+            self.ndvi_attn3 = nn.Identity()
+
+
         _NORMLAYERS = dict(
             ln=nn.LayerNorm,
             bn=nn.BatchNorm2d,
@@ -1153,9 +1194,7 @@ class RSM_SS(nn.Module):
         )
         
         # 输出层：8通道 -> 20通道（对应20类）
-        self.conv_out_seg = nn.Conv2d(8, 20, kernel_size=7, stride=1, padding=3)
-        
-
+        self.conv_out_seg = nn.Conv2d(8, 20, kernel_size=7, stride=1, padding=3)        
         self.apply(self._init_weights)
 
     def _init_weights(self, m: nn.Module):
@@ -1244,35 +1283,46 @@ class RSM_SS(nn.Module):
 
 
     def forward(self, x1: torch.Tensor):
+        # NDVI计算和特征提取
         if self.use_ndvi:
-            # 计算NDVI (假设输入通道顺序: [DTM, Blue, Green, Red, NIR])
-            red, nir = x1[:, 3:4], x1[:, 4:5]  # 保持维度(B,1,H,W)
+            red, nir = x1[:, 3:4], x1[:, 4:5]
             ndvi = (nir - red) / (nir + red + 1e-6)
-            ndvi_feat = self.ndvi_conv(ndvi)  # 提取NDVI特征
+            ndvi_feat = self.ndvi_conv(ndvi)
+            x1 = torch.cat([x1, ndvi_feat], dim=1)
         
-        # 拼接原始输入和NDVI特征
-        x1 = torch.cat([x1, ndvi_feat], dim=1)  # (B,6,H,W)
-
+        # 编码器部分保持不变
         x1 = self.patch_embed(x1)
-
         x1_1 = self.encoder_block1(x1)
         x1_2 = self.encoder_block2(x1_1)
         x1_3 = self.encoder_block3(x1_2)
-        x1_4 = self.encoder_block4(x1_3)  # b,h,w,c
-
-        x1_1 = rearrange(x1_1, "b h w c -> b c h w").contiguous()
-        x1_2 = rearrange(x1_2, "b h w c -> b c h w").contiguous()
-        x1_3 = rearrange(x1_3, "b h w c -> b c h w").contiguous()
-        x1_4 = rearrange(x1_4, "b h w c -> b c h w").contiguous()
-
-
+        x1_4 = self.encoder_block4(x1_3)
+        
+        # 转换为(B,C,H,W)格式
+        x1_1 = rearrange(x1_1, "b h w c -> b c h w")
+        x1_2 = rearrange(x1_2, "b h w c -> b c h w") 
+        x1_3 = rearrange(x1_3, "b h w c -> b c h w")
+        x1_4 = rearrange(x1_4, "b h w c -> b c h w")
+        
+        # 解码器部分加入注意力
         decode_3 = self.deocder_block3(x1_4, x1_3)
+        if self.use_ndvi_attn:
+            ndvi_down4 = F.interpolate(ndvi, size=decode_3.shape[2:], mode='bilinear')
+            decode_3 = self.ndvi_attn3(decode_3, ndvi_down4)
+        
         decode_2 = self.deocder_block2(decode_3, x1_2)
+        if self.use_ndvi_attn:
+            ndvi_down2 = F.interpolate(ndvi, size=decode_2.shape[2:], mode='bilinear')
+            decode_2 = self.ndvi_attn2(decode_2, ndvi_down2)
+        
         decode_1 = self.deocder_block1(decode_2, x1_1)
-
+        if self.use_ndvi_attn:
+            ndvi_down1 = F.interpolate(ndvi, size=decode_1.shape[2:], mode='bilinear')
+            decode_1 = self.ndvi_attn1(decode_1, ndvi_down1)
+        
+        # 后续处理
         output = self.upsample_x4(decode_1)
         output = self.conv_out_seg(output)
-
+        
         return output
 
 
@@ -1296,6 +1346,8 @@ if __name__ == "__main__":
         ssm_conv=3,
         forward_type="v2",  # 使用默认的forward类型
         drop_path_rate=0.1,
+        use_ndvi=True,
+        use_ndvi_attn=True,
         use_checkpoint=False,
     ).to(device)
     
